@@ -34,9 +34,11 @@
 #include <linux/acpi.h>
 #include <linux/list.h>
 #include <linux/uuid.h>
+#include <linux/mutex.h>
 
 #define DRIVER_NAME	"spbm"
-#define SPBM_SIZE	0x1000
+#define SPBM_SIZE	0x1000	/* fallback if _CRS resource size is unavailable */
+#define SPBM_VERSION	"0.4.0"
 
 /* Sentinel: offset not discovered via _DSM */
 #define OFF_UNKNOWN	U32_MAX
@@ -146,6 +148,19 @@ static const struct spbm_chan pwr_eff_chans[] = {
 
 struct spbm_priv {
 	void __iomem *base;
+	/*
+	 * Protects the EWMA accumulators, the energy wraparound state and the
+	 * read-modify-write sequence in spbm_write() against concurrent access.
+	 */
+	struct mutex lock;
+	/* EWMA-smoothed power (hwmon power_average); firmware PID loop makes
+	 * instantaneous readings oscillate, so expose a filtered value too. */
+	u32 pwr_avg[N_PWR];
+	bool pwr_avg_valid[N_PWR];
+	/* Energy counters are 32-bit mJ in firmware (max ~1.19 kWh) and wrap
+	 * around; keep a 64-bit base and the last raw value to detect wraps. */
+	u64 nrg_acc[N_NRG];
+	u32 nrg_last[N_NRG];
 	u32 pwr_off[N_PWR];
 	u32 pwr_cap_off[N_PWR];	/* OS limit for power_cap, or OFF_UNKNOWN */
 	u32 pwr_max_off[N_PWR];	/* firmware limit ceiling for power_max */
@@ -174,7 +189,8 @@ static umode_t spbm_visible(const void *data, enum hwmon_sensor_types type,
 
 	if (type == hwmon_power && ch < N_PWR &&
 	    p->pwr_off[ch] != OFF_UNKNOWN &&
-	    (attr == hwmon_power_input || attr == hwmon_power_label))
+	    (attr == hwmon_power_input || attr == hwmon_power_label ||
+	     attr == hwmon_power_average))
 		return 0444;
 	if (type == hwmon_power && attr == hwmon_power_cap && ch < N_PWR &&
 	    p->pwr_cap_off[ch] != OFF_UNKNOWN)
@@ -206,6 +222,24 @@ static int spbm_read(struct device *dev, enum hwmon_sensor_types type,
 		if (attr == hwmon_power_input &&
 		    p->pwr_off[ch] != OFF_UNKNOWN) {
 			raw = ioread32(p->base + p->pwr_off[ch]);
+			/* Refresh the EWMA whenever a fresh sample is read */
+			mutex_lock(&p->lock);
+			if (p->pwr_avg_valid[ch])
+				p->pwr_avg[ch] = (p->pwr_avg[ch] * 7 + raw) / 8;
+			else {
+				p->pwr_avg[ch] = raw;
+				p->pwr_avg_valid[ch] = true;
+			}
+			mutex_unlock(&p->lock);
+			*val = (long)raw * 1000; /* mW -> uW */
+			return 0;
+		}
+		if (attr == hwmon_power_average &&
+		    p->pwr_off[ch] != OFF_UNKNOWN) {
+			mutex_lock(&p->lock);
+			raw = p->pwr_avg_valid[ch] ? p->pwr_avg[ch] :
+				ioread32(p->base + p->pwr_off[ch]);
+			mutex_unlock(&p->lock);
 			*val = (long)raw * 1000; /* mW -> uW */
 			return 0;
 		}
@@ -234,8 +268,19 @@ static int spbm_read(struct device *dev, enum hwmon_sensor_types type,
 	}
 	if (type == hwmon_energy && attr == hwmon_energy_input && ch < N_NRG &&
 	    p->nrg_off[ch] != OFF_UNKNOWN) {
+		u64 total;
+
 		raw = ioread32(p->base + p->nrg_off[ch]);
-		*val = (long)raw * 1000; /* mJ -> uJ */
+		mutex_lock(&p->lock);
+		/* Firmware keeps a 32-bit mJ counter (~1.19 kWh max). Detect
+		 * wrap-around and extend it to 64 bit so consumers never see
+		 * the counter jump back to zero. */
+		if (p->nrg_last[ch] && raw < p->nrg_last[ch])
+			p->nrg_acc[ch] += 1ULL << 32;
+		p->nrg_last[ch] = raw;
+		total = p->nrg_acc[ch] + raw;
+		mutex_unlock(&p->lock);
+		*val = (long)(total * 1000); /* mJ -> uJ */
 		return 0;
 	}
 	if (type == hwmon_temp && attr == hwmon_temp_input && ch < N_TEMP &&
@@ -273,17 +318,24 @@ static int spbm_write(struct device *dev, enum hwmon_sensor_types type,
 	if (type == hwmon_power && attr == hwmon_power_cap && ch < N_PWR &&
 	    p->pwr_cap_off[ch] != OFF_UNKNOWN) {
 		u32 mw = (u32)(val / 1000);
+		int ret = 0;
 
+		/* Serialise the read-modify-write against the firmware limit
+		 * registers so concurrent writers cannot race. */
+		mutex_lock(&p->lock);
 		/* Enforce firmware floor <= cap <= ceiling; 0 = reset */
 		if (mw > 0 && p->pwr_max_off[ch] != OFF_UNKNOWN &&
 		    mw > ioread32(p->base + p->pwr_max_off[ch]))
-			return -EINVAL;
-		if (mw > 0 && p->pwr_min_off[ch] != OFF_UNKNOWN &&
-		    mw < ioread32(p->base + p->pwr_min_off[ch]))
-			return -EINVAL;
-		iowrite32(mw, p->base + p->pwr_cap_off[ch]);
-		iowrite32(1, p->base);	/* poke UPDATE_SPBM */
-		return 0;
+			ret = -EINVAL;
+		else if (mw > 0 && p->pwr_min_off[ch] != OFF_UNKNOWN &&
+			 mw < ioread32(p->base + p->pwr_min_off[ch]))
+			ret = -EINVAL;
+		else {
+			iowrite32(mw, p->base + p->pwr_cap_off[ch]);
+			iowrite32(1, p->base);	/* poke UPDATE_SPBM */
+		}
+		mutex_unlock(&p->lock);
+		return ret;
 	}
 	return -EOPNOTSUPP;
 }
@@ -298,8 +350,8 @@ static const struct hwmon_ops spbm_ops = {
 /* Build config arrays with a trailing 0 sentinel */
 
 static const u32 pwr_cfg[N_PWR + 1] = {
-	[0 ... N_PWR - 1] = HWMON_P_INPUT | HWMON_P_LABEL | HWMON_P_CAP |
-			    HWMON_P_MAX | HWMON_P_MIN,
+	[0 ... N_PWR - 1] = HWMON_P_INPUT | HWMON_P_LABEL | HWMON_P_AVERAGE |
+			    HWMON_P_CAP | HWMON_P_MAX | HWMON_P_MIN,
 	[N_PWR] = 0,
 };
 
@@ -506,7 +558,7 @@ static int spbm_add(struct acpi_device *adev)
 	struct device *dev = &adev->dev;
 	struct list_head res_list;
 	struct resource_entry *re;
-	resource_size_t phys = 0;
+	resource_size_t phys = 0, span = 0;
 	struct spbm_priv *p;
 	struct device *hwdev;
 	int spbm_idx, idx = 0, ret, resolved, i, j;
@@ -514,6 +566,7 @@ static int spbm_add(struct acpi_device *adev)
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
+	mutex_init(&p->lock);
 
 	/* Initialize all offsets to "unknown" */
 	memset(p->pwr_off, 0xFF, sizeof(p->pwr_off));
@@ -588,6 +641,7 @@ static int spbm_add(struct acpi_device *adev)
 		if (resource_type(re->res) == IORESOURCE_MEM) {
 			if (idx == spbm_idx) {
 				phys = re->res->start;
+				span = resource_size(re->res);
 				break;
 			}
 			idx++;
@@ -600,8 +654,10 @@ static int spbm_add(struct acpi_device *adev)
 			spbm_idx);
 		return -ENODEV;
 	}
+	if (!span)
+		span = SPBM_SIZE;
 
-	p->base = devm_ioremap(dev, phys, SPBM_SIZE);
+	p->base = devm_ioremap(dev, phys, span);
 	if (!p->base)
 		return -ENOMEM;
 
@@ -702,3 +758,4 @@ module_acpi_driver(spbm_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Antheas Kapenekakis <antheas@cs.aau.dk>");
 MODULE_DESCRIPTION("NVIDIA DGX Spark (GB10) SPBM power hwmon driver");
+MODULE_VERSION(SPBM_VERSION);

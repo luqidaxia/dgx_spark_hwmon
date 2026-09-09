@@ -40,7 +40,9 @@ echo "==> [4/5] dkms build + install"
 dkms build "spbm/$VER"
 dkms install "spbm/$VER"
 
-echo "==> [5/5] 加载模块"
+echo "==> [5/5] 重新加载模块"
+# 若旧版本仍在内存中，必须先卸载，否则 modprobe 不会替换已加载的模块
+modprobe -r spbm 2>/dev/null || true
 modprobe spbm || true
 sleep 1
 
