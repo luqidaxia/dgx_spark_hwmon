@@ -1,5 +1,7 @@
 # SPBM - DGX Spark Power Telemetry & Control hwmon Driver
 
+> **简体中文说明见 [README.zh-CN.md](README.zh-CN.md)** — Chinese documentation available.
+
 Linux hwmon driver for the NVIDIA DGX Spark (GB10 SoC) that exposes
 full system power telemetry and power limit controls via standard
 `sensors` / sysfs interfaces.
